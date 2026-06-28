@@ -1,171 +1,52 @@
-# animepahe-dl
+# animepahe-dl (Unraid Fork)
 
-> Download anime videos from [animepahe](https://animepahe.com/) in terminal
+Forked from [KevCui/animepahe-dl](https://github.com/KevCui/animepahe-dl). This fork adds several quality-of-life improvements tailored for self-hosted Unraid setups, where anime is downloaded to a NAS media share and Cloudflare bypass needs to be fully automated.
 
-## Table of Contents
+## What's different from upstream
 
-- [Dependency](#dependency)
-- [How to use](#how-to-use)
-  - [Example](#example)
-- [Disclaimer](#disclaimer)
+### Automatic Cloudflare bypass via CF-Clearance-Scraper
 
-## Dependency
+The original script requires you to manually grab `cf_clearance` and `user-agent` from your browser and paste them into `config.json`. This fork replaces that with an automatic call to [CF-Clearance-Scraper](https://github.com/Xewdy444/CF-Clearance-Scraper) at startup, so credentials are always fresh without any manual intervention — important for unattended/scheduled runs on Unraid.
 
-- [jq](https://stedolan.github.io/jq/)
-- [fzf](https://github.com/junegunn/fzf)
-- [ffmpeg](https://ffmpeg.org/download.html)
-
-## How to use
-
-- Configuration
-
-1. Open browser, visit https://animepahe.pw, solve Cloudflare
-2. Get `cf_clearance` cookie value, and `user-agent` value from your browser
-3. Edit `config.json`, put your `cf_clearance` and `user-agent`, like following:
+The scraper runs inside its own Python virtualenv. Configure it in `config.json`:
 
 ```json
 {
-  "cf": "YOUR_CF_CLEARANCE",
-  "ua": "YOUR_USER_AGENT"
+  "scraper_path": "/path/to/CF-Clearance-Scraper",
+  "scraper_venv": "/path/to/CF-Clearance-Scraper/cf-scraper",
 }
 ```
 
-- Usage
+`scraper_venv` defaults to `<scraper_path>/cf-scraper` if omitted.
 
-```
-Usage:
-  ./animepahe-dl.sh [-a <anime name>] [-s <anime_slug>] [-e <episode_num1,num2,num3-num4...>] [-r <resolution>] [-l] [-d]
+### Auto-install of fzf and ffmpeg
 
-Options:
-  -a <name>               anime name
-  -s <slug>               anime slug/uuid, can be found in $_ANIME_LIST_FILE
-                          ignored when "-a" is enabled
-  -e <num1,num3-num4...>  optional, episode number to download
-                          multiple episode numbers seperated by ","
-                          episode range using "-"
-                          all episodes using "*"
-  -r <resolution>         optional, specify resolution: "1080", "720"...
-                          by default, the highest resolution is selected
-  -o <language>           optional, specify audio language: "eng", "jpn"...
-  -l                      optional, show m3u8 playlist link without downloading videos
-  -d                      enable debug mode
-  -h | --help             display this help message
-```
+On Unraid, user-installed packages don't survive a reboot — the OS boots from a USB flash drive and the root filesystem is rebuilt each time. To avoid having to reinstall `fzf` and `ffmpeg` after every reboot, the script checks for them at startup and downloads/installs them automatically if missing. This makes the script safe to run as an Unraid User Script or scheduled job without any manual setup after a reboot.
 
-### Example
+### Smart episode caching
 
-- Simply run script to search anime name and select the right one in `fzf`:
+Episode lists are cached locally in `.source.json` per anime. On subsequent runs, if no specific episode is requested, the script only fetches the last page of the API to check for new episodes — rather than re-downloading the full episode list every time. This reduces unnecessary API calls and speeds up repeated runs.
 
-```bash
-$ ./animepahe-dl.sh
-<anime list in fzf>
-...
+### Resume / auto-increment from last downloaded episode
+
+The script tracks the last successfully downloaded episode per anime, keyed by audio language and resolution (e.g. `jpn_720`). On the next run without a `-e` flag, it automatically figures out the next episode to download. If a range of new episodes is available (e.g. 20–23 released since you last ran it), it queues them all. If the next episode isn't out yet, it tells you when the last one was released and estimates when the next one might drop (based on a 7-day cadence). If it's been more than 7 days past that estimate, it flags the series as potentially on hiatus.
+
+### Plex-friendly output filenames
+
+Downloaded files are named in the format `Anime Name - S01E05.mp4`, which Plex and Jellyfin pick up correctly without any manual renaming. Season number is detected automatically from the anime title (e.g. "Season 2" → `S02`).
+
+## Configuration
+
+Minimal `config.json`:
+
+```json
+{
+  "scraper_path": "/mnt/user/appdata/animepahe-dl/CF-Clearance-Scraper"
+}
 ```
 
-- Search anime by its name:
+All other keys are optional and have sensible defaults.
 
-```bash
-$ ./animepahe-dl.sh -a 'attack on titan'
-<anime list in fzf>
-```
+## Everything else
 
-- By default, anime slug/uuid is stored in `./anime.list` file. Be aware that the value of anime slug/uuid often changes, not permanent. Download "One Punch Man" season 2 episode 3:
-
-```bash
-$ ./animepahe-dl.sh -s 308f5756-6715-e404-998d-92f16b9d9858 -e 3
-```
-
-- List "One Punch Man" season 2 all episodes:
-
-```bash
-$ ./animepahe-dl.sh -s 308f5756-6715-e404-998d-92f16b9d9858
-[1] E1 2019-04-09 18:45:38
-[2] E2 2019-04-16 17:54:48
-[3] E3 2019-04-23 17:51:20
-[4] E4 2019-04-30 17:51:37
-[5] E5 2019-05-07 17:55:53
-[6] E6 2019-05-14 17:52:04
-[7] E7 2019-05-21 17:54:21
-[8] E8 2019-05-28 22:51:16
-[9] E9 2019-06-11 17:48:50
-[10] E10 2019-06-18 17:50:25
-[11] E11 2019-06-25 17:59:38
-[12] E12 2019-07-02 18:01:11
-```
-
-- Support batch downloads: list "One Punch Man" season 2 episode 2, 5, 6, 7:
-
-```bash
-$ ./animepahe-dl.sh -s 308f5756-6715-e404-998d-92f16b9d9858 -e 2,5,6,7
-[INFO] Downloading Episode 2...
-...
-[INFO] Downloading Episode 5...
-...
-[INFO] Downloading Episode 6...
-...
-[INFO] Downloading Episode 7...
-...
-```
-
-OR using episode range:
-
-```bash
-$ ./animepahe-dl.sh -s 308f5756-6715-e404-998d-92f16b9d9858 -e 2,5-7
-[INFO] Downloading Episode 2...
-...
-[INFO] Downloading Episode 5...
-...
-[INFO] Downloading Episode 6...
-...
-[INFO] Downloading Episode 7...
-...
-```
-
-- Download all episodes using `*`:
-
-```bash
-$ ./animepahe-dl.sh -s 308f5756-6715-e404-998d-92f16b9d9858 -e '*'
-[INFO] Downloading Episode 1...
-...
-[INFO] Downloading Episode 2...
-...
-[INFO] Downloading Episode 3...
-...
-```
-
-- Specify video resolution:
-
-```bash
-$ ./animepahe-dl.sh -a jujutsu -e 5 -r 360
-[INFO] Select video resolution: 360
-[INFO] Downloading Episode 5...
-```
-
-- Specify audio language:
-
-```bash
-$ ./animepahe-dl.sh -a 'samurai 7' -e 1 -o eng
-[INFO] Select audio language: eng
-[INFO] Downloading Episode 1...
-```
-
-- Show only m3u8 playlist link, without downloading video file:
-
-```bash
-$ ./animepahe-dl.sh -s 308f5756-6715-e404-998d-92f16b9d9858 -e 5 -l
-...
-```
-
-It's useful to toss m3u8 into media player and stream:
-
-```bash
-$ mpv --http-header-fields="Referer: https://kwik.cx/" "$(./animepahe-dl.sh -s 308f5756-6715-e404-998d-92f16b9d9858 -e 5 -l)"
-```
-
-## Disclaimer
-
-The purpose of this script is to download anime episodes in order to watch them later in case when Internet is not available. Please do NOT copy or distribute downloaded anime episodes to any third party. Watch them and delete them afterwards. Please use this script at your own responsibility.
-
----
-
-<a href="https://www.buymeacoffee.com/kevcui" target="_blank"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-orange.png" alt="Buy Me A Coffee" height="60px" width="217px"></a>
+Usage, flags, and all other behaviour are identical to upstream — see the [original README](https://github.com/KevCui/animepahe-dl) for full documentation.
