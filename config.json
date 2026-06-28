@@ -1,4 +1,3 @@
 {
-  "scraper_path": "/path/to/CF-Clearance-Scraper",
-  "scraper_venv": "/path/to/CF-Clearance-Scraper/cf-scraper",
+  "scraper_path": "/path/to/CF-Clearance-Scraper"
 }
