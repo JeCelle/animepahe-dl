@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+
 # Download anime from animepahe in terminal
 #
 #/ Usage:
@@ -6,6 +7,11 @@
 #/
 #/ Options:
 #/   -a <name>               anime name
+#/                           if the search/browse list has more than one match
+#/                           (e.g. multiple seasons of the same show), use TAB
+#/                           in the fzf picker to select several entries and
+#/                           they will be queued and downloaded one after another
+#/                           in this same session
 #/   -s <slug>               anime slug/uuid, can be found in $_ANIME_LIST_FILE
 #/                           ignored when "-a" is enabled
 #/   -e <num1,num3-num4...>  optional, episode number to download
@@ -18,6 +24,10 @@
 #/   -l                      optional, show m3u8 playlist link without downloading videos
 #/   -d                      enable debug mode
 #/   -h | --help             display this help message
+#/
+#/ Environment:
+#/   FLARESOLVERR_URL        service URL (default: http://192.168.5.111:8191)
+#/                           set empty to use manual cf updates only
 
 set -e
 set -u
@@ -26,78 +36,12 @@ usage() {
     printf "%b\n" "$(grep '^#/' "$0" | cut -c4-)" && exit 1
 }
 
-refresh_cf_clearance() {
-    # Calls CF-Clearance-Scraper to obtain a fresh cf_clearance cookie and user-agent.
-    # Reads scraper config from config.json:
-    #   .scraper_path  – path to the CF-Clearance-Scraper directory (default: same dir as this script)
-    #   .scraper_ua    – user-agent to pass to the scraper (default: built-in Chrome UA)
-    #   .scraper_timeout – timeout in seconds passed to -t (default: 60)
-    # On success, sets _CF_CLEARANCE and _USER_AGENT globals.
-
-    local scraper_dir scraper_venv scraper_python scraper_ua scraper_timeout scraper_output cookie_file
-    local config="$_SCRIPT_PATH/config.json"
-
-    # Read optional overrides from config.json (fall back to sensible defaults)
-    scraper_dir="$("$_JQ" -r '.scraper_path // empty' "$config" 2>/dev/null)"
-    scraper_dir="${scraper_dir:-$_SCRIPT_PATH/CF-Clearance-Scraper}"
-
-    # venv path: defaults to a "cf-scraper" venv sibling of the scraper directory
-    scraper_venv="$("$_JQ" -r '.scraper_venv // empty' "$config" 2>/dev/null)"
-    scraper_venv="${scraper_venv:-$scraper_dir/cf-scraper}"
-
-    # Use the venv's python binary directly — no need to activate
-    scraper_python="$scraper_venv/bin/python"
-    if [[ ! -x "$scraper_python" ]]; then
-        print_error "CF scraper venv python not found at '$scraper_python'. Set 'scraper_venv' in config.json to the correct venv path."
-    fi
-
-    scraper_ua="$("$_JQ" -r '.scraper_ua // empty' "$config" 2>/dev/null)"
-    scraper_ua="${scraper_ua:-Mozilla/5.0 (X11; Linux x86_64; rv:152.0) Gecko/20100101 Firefox/152.0}"
-
-    scraper_timeout="$("$_JQ" -r '.scraper_timeout // empty' "$config" 2>/dev/null)"
-    scraper_timeout="${scraper_timeout:-60}"
-
-    cookie_file="$(mktemp /tmp/cf_cookies_XXXXXX.json)"
-
-    print_info "Running CF-Clearance-Scraper to obtain fresh cf_clearance..."
-
-    # Run the scraper using the venv python; capture combined stdout+stderr to parse the cookie line
-    scraper_output="$(
-        cd "$scraper_dir" && \
-        "$scraper_python" main.py \
-            -t "$scraper_timeout" \
-            -ua "$scraper_ua" \
-            -f "$cookie_file" \
-            "$_HOST/api?m=search" \
-            2>&1
-    )" || true
-
-    # Extract cf_clearance value from the scraper log line:
-    #   [INFO] Cookie: cf_clearance=<value>
-    local new_cf
-    new_cf="$(grep -oP '(?<=Cookie: cf_clearance=)\S+' <<< "$scraper_output" | tail -1)"
-
-    if [[ -z "${new_cf:-}" ]]; then
-        # Fall back to reading from the dumped cookie JSON if the log line was absent
-        new_cf="$("$_JQ" -r '.[] | select(.name=="cf_clearance") | .value' "$cookie_file" 2>/dev/null | tail -1)"
-    fi
-
-    rm -f "$cookie_file"
-
-    if [[ -z "${new_cf:-}" ]]; then
-        print_error "CF-Clearance-Scraper did not return a cf_clearance cookie. Output was:\n$scraper_output"
-    fi
-
-    _CF_CLEARANCE="$new_cf"
-    _USER_AGENT="$scraper_ua"
-    print_info "cf_clearance refreshed successfully."
-}
-
 set_var() {
     _CURL="$(command -v curl)" || command_not_found "curl"
     _JQ="$(command -v jq)" || command_not_found "jq"
     _FZF="$(command -v fzf)" || command_not_found "fzf"
-    _FFMPEG="$(command -v ffmpeg)" || command_not_found "ffmpeg"
+    _YTDLP="$(command -v yt-dlp)" || command_not_found "yt-dlp"
+    _NODE="$(command -v node)" || command_not_found "node"
 
     _HOST="https://animepahe.pw"
     _ANIME_URL="$_HOST/anime"
@@ -107,15 +51,12 @@ set_var() {
 
     _SCRIPT_PATH=$(dirname "$(realpath "$0")")
     _DOWNLOAD_PATH="/mnt/user/data/media/unsorted"
+    _CONFIG_FILE="$_SCRIPT_PATH/config.json"
+    _USER_AGENT="$("$_JQ" -r '.ua // empty' "$_CONFIG_FILE")"
+    _CF_CLEARANCE="$("$_JQ" -r '.cf // empty' "$_CONFIG_FILE")"
+    _FLARESOLVERR_URL="${FLARESOLVERR_URL-http://192.168.5.111:8191}"
     _ANIME_LIST_FILE="$_SCRIPT_PATH/anime.list"
     _SOURCE_FILE=".source.json"
-
-    # Dynamically obtain cf_clearance and user-agent via the CF scraper.
-    # If you prefer to use static values from config.json instead, comment out
-    # the refresh_cf_clearance call below and uncomment the two lines after it.
-    refresh_cf_clearance
-    # _USER_AGENT="$("$_JQ" -r '.ua' "$_SCRIPT_PATH/config.json")"
-    # _CF_CLEARANCE="$("$_JQ" -r '.cf' "$_SCRIPT_PATH/config.json")"
 }
 
 install_dependencies_if_needed() {
@@ -123,13 +64,13 @@ install_dependencies_if_needed() {
     local _cwd
     _cwd="$(pwd)"
 
-    if ! command -v fzf >/dev/null; then
+    if ! command -v fzf >/dev/null 2>&1; then
         echo "[INFO] fzf not found. Installing..."
         install_needed=true
     fi
 
-    if ! command -v ffmpeg >/dev/null; then
-        echo "[INFO] ffmpeg not found. Installing..."
+    if ! command -v yt-dlp >/dev/null 2>&1; then
+        echo "[INFO] yt-dlp not found. Installing..."
         install_needed=true
     fi
 
@@ -137,16 +78,15 @@ install_dependencies_if_needed() {
         local FZF_VERSION="v0.64.0"
         local FZF_FILE="fzf-0.64.0-linux_amd64.tar.gz"
         local FZF_URL="https://github.com/junegunn/fzf/releases/download/${FZF_VERSION}/${FZF_FILE}"
-        local FFMPEG_VERSION="6.1"
-        local FFMPEG_FILE="ffmpeg-master-latest-linux64-gpl.tar.xz"
-        local FFMPEG_URL="https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/${FFMPEG_FILE}"
+
+        local YTDLP_URL="https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux"
 
         echo "[INFO] Creating temp workspace..."
         local WORKDIR
         WORKDIR="$(mktemp -d)"
-        cd "$WORKDIR"
+        cd "$WORKDIR" || exit 1
 
-        if ! command -v fzf >/dev/null; then
+        if ! command -v fzf >/dev/null 2>&1; then
             echo "[INFO] Downloading fzf ${FZF_VERSION}..."
             wget -q --show-progress "$FZF_URL"
             tar -xzf "$FZF_FILE"
@@ -154,18 +94,16 @@ install_dependencies_if_needed() {
             mv fzf /usr/local/bin/
         fi
 
-        if ! command -v ffmpeg >/dev/null; then
-            echo "[INFO] Downloading ffmpeg ${FFMPEG_VERSION}..."
-            wget -q --show-progress "$FFMPEG_URL"
-            tar -xf "$FFMPEG_FILE"
-            cd ffmpeg-master-latest-linux64-gpl/bin/
-            chmod +x ffmpeg ffprobe
-            mv ffmpeg ffprobe /usr/local/bin/
+        if ! command -v yt-dlp >/dev/null 2>&1; then
+            echo "[INFO] Downloading latest yt-dlp..."
+            wget -q --show-progress -O yt-dlp "$YTDLP_URL"
+            chmod +x yt-dlp
+            mv yt-dlp /usr/local/bin/
         fi
 
         echo "[INFO] Cleaning up..."
+        cd "$_cwd" || exit 1
         rm -rf "$WORKDIR"
-        cd "$_cwd"
     fi
 }
 
@@ -227,10 +165,87 @@ command_not_found() {
     print_error "$1 command not found!"
 }
 
-get() {
-    # $1: url
-    "$_CURL" -sS -L "$1" -b "cf_clearance=$_CF_CLEARANCE" -A "$_USER_AGENT" --compressed
+refresh_cf_with_flaresolverr() {
+    local payload response cf ua tmp
+    print_info "Refreshing Cloudflare clearance with FlareSolverr..."
+    payload="$("$_JQ" -n --arg url "$_HOST/" \
+        '{cmd: "request.get", url: $url, maxTimeout: 60000, returnOnlyCookies: true}')"
+    if ! response="$("$_CURL" -fsS --connect-timeout 5 --max-time 70 \
+        -H 'Content-Type: application/json' --data "$payload" \
+        "${_FLARESOLVERR_URL%/}/v1")"; then
+        print_warn "Could not reach FlareSolverr or its request failed."
+        return 1
+    fi
+    if ! "$_JQ" -e '.status == "ok" and (.solution.status == 200)' \
+        >/dev/null 2>&1 <<< "$response"; then
+        print_warn "FlareSolverr could not solve the Cloudflare challenge."
+        return 1
+    fi
+    cf="$("$_JQ" -r '[.solution.cookies[]? | select(.name == "cf_clearance") | .value][0] // empty' <<< "$response")"
+    ua="$("$_JQ" -r '.solution.userAgent // empty' <<< "$response")"
+    if [[ -z "$cf" || "$cf" =~ [[:space:]\;\,] || -z "$ua" || "$ua" == *$'\n'* || "$ua" == *$'\r'* ]]; then
+        print_warn "FlareSolverr did not return a valid clearance cookie and user-agent."
+        return 1
+    fi
+    tmp="$(mktemp "$_SCRIPT_PATH/.config.json.XXXXXX")" || return 1
+    if ! "$_JQ" --arg cf "$cf" --arg ua "$ua" '.cf = $cf | .ua = $ua' \
+        "$_CONFIG_FILE" > "$tmp" || ! mv "$tmp" "$_CONFIG_FILE"; then
+        rm -f "$tmp"
+        print_warn "Could not save FlareSolverr clearance in config.json."
+        return 1
+    fi
+    print_info "Updated clearance and user-agent. Retrying..."
+    return 0
+}
 
+get() {
+    # Reload credentials: callers often run in command-substitution subshells.
+    local response status cf ua
+    cf="$("$_JQ" -r '.cf // empty' "$_CONFIG_FILE")" || return 1
+    ua="$("$_JQ" -r '.ua // empty' "$_CONFIG_FILE")" || return 1
+    response="$("$_CURL" -sS -L "$1" -b "cf_clearance=$cf" -A "$ua" \
+        --compressed -w $'\n%{http_code}')" || return 1
+    status="${response##*$'\n'}"
+    response="${response%$'\n'*}"
+    # Successful pages also contain Cloudflare background scripts.
+    if [[ "$1" == "$_HOST/"* && -n "${_FLARESOLVERR_URL:-}" ]] && \
+        { [[ "$status" == 403 || "$status" == 503 ]] || \
+          grep -qiE '<title>[[:space:]]*Just a moment' <<< "$response"; }; then
+        if refresh_cf_with_flaresolverr; then
+            cf="$("$_JQ" -r '.cf' "$_CONFIG_FILE")" || return 1
+            ua="$("$_JQ" -r '.ua' "$_CONFIG_FILE")" || return 1
+            "$_CURL" -sS -L "$1" -b "cf_clearance=$cf" -A "$ua" --compressed
+            return $?
+        fi
+    fi
+    printf '%s\n' "$response"
+}
+
+refresh_cf_clearance() {
+    local cf tmp
+
+    if [[ ! -t 0 ]]; then
+        print_error "AnimePahe requires a new cf value in config.json, but stdin is not interactive."
+    fi
+
+    print_warn "AnimePahe requires a new cf value."
+    printf "Enter new cf value: " >&2
+    IFS= read -r cf || print_error "Could not read new cf value."
+    cf="${cf#"${cf%%[![:space:]]*}"}"
+    cf="${cf%"${cf##*[![:space:]]}"}"
+
+    if [[ -z "$cf" || "$cf" =~ [[:space:]\;\,] ]]; then
+        print_error "Invalid cf value. It must be non-empty and contain no whitespace, semicolon, or comma."
+    fi
+
+    tmp="$(mktemp "$_SCRIPT_PATH/.config.json.XXXXXX")"
+    if ! "$_JQ" --arg cf "$cf" '.cf = $cf' "$_CONFIG_FILE" > "$tmp"; then
+        rm -f "$tmp"
+        print_error "Could not update cf in config.json."
+    fi
+    mv "$tmp" "$_CONFIG_FILE"
+    _CF_CLEARANCE="$cf"
+    print_info "Updated config.json. Retrying..."
 }
 
 download_anime_list() {
@@ -240,18 +255,37 @@ download_anime_list() {
     > "$_ANIME_LIST_FILE"
 }
 
+dedupe_anime_list() {
+    # keep only the last occurrence of each unique slug, preserve file order otherwise
+    [[ -f "$_ANIME_LIST_FILE" ]] || return 0
+    local tmp
+    tmp="$(mktemp)"
+    tac "$_ANIME_LIST_FILE" \
+        | awk -F']' '!seen[$1]++' \
+        | tac \
+        > "$tmp"
+    mv "$tmp" "$_ANIME_LIST_FILE"
+}
+
 search_anime_by_name() {
     # $1: anime name
     local d n
     d="$(get "$_HOST/api?m=search&q=${1// /%20}")"
-    n="$("$_JQ" -r '.total' <<< "$d" 2>/dev/null)"
-    [[ -z "${n:-}" ]] && print_error "No search result... Need a new cf value in config.json"
+    n="$("$_JQ" -r '.total' <<< "$d" 2>/dev/null || true)"
+    if [[ -z "${n:-}" || "$n" == "null" ]]; then
+        if [[ -n "${_CF_REFRESH_RETRY:-}" ]]; then
+            print_error "AnimePahe search failed after retrying with updated cf value."
+        fi
+        refresh_cf_clearance
+        return 2
+    fi
     if [[ "$n" -eq "0" ]]; then
         echo ""
     else
         "$_JQ" -r '.data[] | "[\(.session)] \(.title)   "' <<< "$d" \
             | tee -a "$_ANIME_LIST_FILE" \
             | remove_slug
+        dedupe_anime_list
     fi
 }
 
@@ -262,11 +296,18 @@ get_episode_list() {
 }
 
 download_source() {
-    local d p n i
+    local d p n i cf_retry=false
     mkdir -p "$_DOWNLOAD_PATH/$_ANIME_NAME"
-    d="$(get_episode_list "$_ANIME_SLUG" "1")"
-    p="$("$_JQ" -r '.last_page' <<< "$d" 2>/dev/null)"
-    [[ -z "${p:-}" ]] && print_error "No search result... Need a new cf value in config.json"
+    while true; do
+        d="$(get_episode_list "$_ANIME_SLUG" "1")"
+        p="$("$_JQ" -r '.last_page' <<< "$d" 2>/dev/null || true)"
+        [[ -n "${p:-}" && "$p" != "null" ]] && break
+        if [[ "$cf_retry" == true ]]; then
+            print_error "AnimePahe episode lookup failed after retrying with updated cf value."
+        fi
+        refresh_cf_clearance
+        cf_retry=true
+    done
 
     # Check if we already have cached episodes and didn't explicitly request all
     local cached_source="$_DOWNLOAD_PATH/$_ANIME_NAME/$_SOURCE_FILE"
@@ -281,7 +322,6 @@ download_source() {
             if [[ "$p" -gt "1" ]]; then
                 print_info "Checking for new episodes (page $p of $p)..."
                 n="$(get_episode_list "$_ANIME_SLUG" "$p")"
-                ensure_json_response "$n" "episode list page $p"
                 d="$(echo "$d $n" | "$_JQ" -s '.[0].data + .[1].data | {data: .}')"
             fi
         fi
@@ -292,7 +332,6 @@ download_source() {
         for i in $(seq 2 "$p"); do
             print_info "Fetching episodes (page $i of $p)..."
             n="$(get_episode_list "$_ANIME_SLUG" "$i")"
-            ensure_json_response "$n" "episode list page $i"
             d="$(echo "$d $n" | "$_JQ" -s '.[0].data + .[1].data | {data: .}')"
         done
     fi
@@ -337,9 +376,13 @@ get_episode_link() {
 }
 run_js_code() {
     # $1: js code
-    curl -sS -X POST 'https://glot.io/run/javascript?version=latest' \
-        -H 'Content-Type: application/json' \
-        --data-raw $'{"files":[{"name":"main.js","content":"'"$1"'"}],"stdin":"","command":"node main.js"}'
+    "$_NODE" -e '
+        const vm = require("vm");
+        const video = { set src(value) { throw new Error("source=" + value); } };
+        const sandbox = { document: { cookie: "", querySelector() { return video; } }, window: {}, Hls: { isSupported() { return false; } }, Plyr: function () {}, screen: { orientation: { lock() {} } } };
+        try { vm.runInNewContext(process.argv[1], sandbox, { timeout: 5000 }); }
+        catch (error) { console.error(error.stack || error); }
+    ' "$1" 2>&1
 }
 
 get_playlist_link() {
@@ -348,15 +391,10 @@ get_playlist_link() {
     while read -r t; do
         s="$("$_CURL" --compressed -sS -H "Referer: $_REFERER_HOST" "$t" \
             | grep "<script>eval" \
-            | awk -F 'script>' '{print $2}' \
-            | sed 's/\\/\\\\/g' \
-            | sed 's/"/\\"/g')"
+            | awk -F 'script>' '{print $2}')"
 
         l="$(run_js_code "$s" \
-            | "$_JQ" -r .stderr \
-            | grep 'source=' \
-            | sed 's/.m3u8.*/.m3u8/' \
-            | sed 's/.*https/https/')"
+            | sed -n 's/^Error: source=\(https:\/\/[^[:space:]]*\.m3u8\).*/\1/p')"
 
         if [[ -n "${l:-}" ]]; then
             echo "$l"
@@ -498,7 +536,12 @@ download_episode() {
             extpicky="-extension_picky 0"
         fi
 
-        "$_FFMPEG" $extpicky -headers "Referer: $_REFERER_URL" -i "$pl" -c copy $erropt -y "$v"
+        "$_YTDLP" "$pl" --referer "$_REFERER_URL" --impersonate chrome --no-warnings -q --progress -o "$v"
+        if [[ $? -eq 0 ]]; then
+            save_last_episode "$num"
+        else
+            print_warn "yt-dlp failed for episode $num, not marking as last downloaded."
+        fi
 
     else
         echo "$pl"
@@ -522,51 +565,28 @@ remove_slug() {
 }
 
 get_slug_from_name() {
-    # $1: anime name
-    [[ -z "${1:-}" ]] && return 1
-    grep -F "] $1" "$_ANIME_LIST_FILE" | tail -1 | remove_brackets
+    local name="$1"
+    [[ -z "$name" ]] && return 1
+
+    awk -F']' -v want="$name" '{
+        title = $0
+        sub(/^[^]]*\]/, "", title)
+        gsub(/^[ \t]+|[ \t]+$/, "", title)
+        if (title == want) print $0
+    }' "$_ANIME_LIST_FILE" | tail -n1 | remove_brackets
 }
 
 check_config() {
-    if [[ -z "${_CF_CLEARANCE:-}" ]]; then
-        print_error "cf_clearance is empty. The CF-Clearance-Scraper may have failed. Check that 'scraper_path' in config.json points to the CF-Clearance-Scraper directory."
+    if [[ -z "${_CF_CLEARANCE:-}" && -z "${_FLARESOLVERR_URL:-}" ]]; then
+        print_error "Missing cf_clearance, please add it in config.json!"
     fi
-    if [[ -z "${_USER_AGENT:-}" ]]; then
-        print_error "User-agent is empty. Check 'scraper_ua' in config.json or the scraper output."
+    if [[ -z "${_USER_AGENT:-}" && -z "${_FLARESOLVERR_URL:-}" ]]; then
+        print_error "Missing user-agent, please add it in config.json!"
     fi
 }
 
-main() {
-    install_dependencies_if_needed
-    set_args "$@"
-    set_var
-    check_config
-
-    if [[ -n "${_INPUT_ANIME_NAME:-}" ]]; then
-        _ANIME_NAME=$("$_FZF" -1 <<< "$(search_anime_by_name "$_INPUT_ANIME_NAME")")
-        [[ -z "${_ANIME_NAME:-}" ]] && print_error "Anime not found for search: $_INPUT_ANIME_NAME"
-        _ANIME_SLUG="$(get_slug_from_name "$_ANIME_NAME")"
-    else
-        download_anime_list
-        if [[ -z "${_ANIME_SLUG:-}" ]]; then
-            _ANIME_NAME=$("$_FZF" -1 <<< "$(remove_slug < "$_ANIME_LIST_FILE")")
-            _ANIME_SLUG="$(get_slug_from_name "$_ANIME_NAME")"
-        fi
-    fi
-
-    [[ "$_ANIME_SLUG" == "" ]] && print_error "Anime slug not found!"
-    _ANIME_NAME="$(grep "$_ANIME_SLUG" "$_ANIME_LIST_FILE" \
-        | tail -1 \
-        | remove_slug \
-        | sed -E 's/[[:space:]]+$//' \
-        | sed -E 's/[^[:alnum:] ,\+\-\)\(]/_/g')"
-
-    if [[ "$_ANIME_NAME" == "" ]]; then
-        print_warn "Anime name not found! Try again."
-        download_anime_list
-        exit 1
-    fi
-
+process_one_anime() {
+    # uses/sets globals: _ANIME_SLUG _ANIME_NAME _ANIME_EPISODE
     download_source
 
     # improved behavior: if user did not specify episodes, try to auto-increment from saved state
@@ -614,7 +634,12 @@ main() {
                     fi
                 fi
 
-                # ask user whether to select episodes now
+                # ask user whether to select episodes now (skip prompt in unattended
+                # queue mode — just move on to the next queued anime/season)
+                if [[ "${total:-1}" -gt 1 ]]; then
+                    print_info "No new episode available yet for $_ANIME_NAME; skipping in unattended queue mode."
+                    return 0
+                fi
                 echo -n "Do you want to select episodes to download now? [y/N] " >&2
                 read -r _ans
                 case "$_ans" in
@@ -623,15 +648,96 @@ main() {
                         ;;
                     *)
                         print_info "OK. Exiting."
-                        exit 0
+                        return 0
                         ;;
                 esac
             fi
         fi
     fi
 
-    [[ -z "${_ANIME_EPISODE:-}" ]] && _ANIME_EPISODE=$(select_episodes_to_download)
+    if [[ -z "${_ANIME_EPISODE:-}" ]]; then
+        if [[ "${total:-1}" -gt 1 ]]; then
+            # unattended queue mode: no explicit -e and nothing downloaded before,
+            # so just grab everything available for this season rather than prompt
+            print_info "No -e given and no prior download state for $_ANIME_NAME; downloading all available episodes."
+            _ANIME_EPISODE="*"
+        else
+            _ANIME_EPISODE=$(select_episodes_to_download)
+        fi
+    fi
     download_episodes "$_ANIME_EPISODE"
+}
+
+main() {
+    install_dependencies_if_needed
+    set_args "$@"
+    set_var
+    check_config
+
+    # remember whatever episode spec the user passed on the command line (if any)
+    # so it can be re-applied fresh to every queued anime/season below
+    local _ANIME_EPISODE_ARG="${_ANIME_EPISODE:-}"
+    local -a selected_names=()
+
+    if [[ -n "${_INPUT_ANIME_NAME:-}" ]]; then
+        local_search_status=0
+        search_results=$(search_anime_by_name "$_INPUT_ANIME_NAME") || local_search_status=$?
+        if [[ "$local_search_status" -eq 2 ]]; then
+            _CF_CLEARANCE="$("$_JQ" -r '.cf' "$_CONFIG_FILE")"
+            search_results=$( _CF_REFRESH_RETRY=true; search_anime_by_name "$_INPUT_ANIME_NAME")
+        elif [[ "$local_search_status" -ne 0 ]]; then
+            exit "$local_search_status"
+        fi
+        [[ -z "${search_results:-}" ]] && print_error "Anime not found for search: $_INPUT_ANIME_NAME"
+        # -1 auto-picks instantly when there is only a single match (old behavior);
+        # -m lets you TAB-select several seasons/entries when there are more than one
+        mapfile -t selected_names < <("$_FZF" -1 -m --header 'TAB to queue multiple seasons, ENTER to confirm' <<< "$search_results")
+        [[ ${#selected_names[@]} -eq 0 ]] && print_error "No anime selected."
+    else
+        download_anime_list
+        if [[ -n "${_ANIME_SLUG:-}" ]]; then
+            local nm
+            nm="$(grep -F "$_ANIME_SLUG" "$_ANIME_LIST_FILE" | tail -1 | remove_slug | sed -E 's/[[:space:]]+$//')"
+            [[ -z "$nm" ]] && print_error "Anime slug not found!"
+            selected_names=("$nm")
+        else
+            mapfile -t selected_names < <("$_FZF" -1 -m --header 'TAB to queue multiple, ENTER to confirm' <<< "$(remove_slug < "$_ANIME_LIST_FILE")")
+            [[ ${#selected_names[@]} -eq 0 ]] && print_error "No anime selected."
+        fi
+    fi
+
+    local total=${#selected_names[@]}
+    [[ "$total" -gt 1 ]] && print_info "Queued $total seasons/entries for this session."
+
+    local idx=0 name
+    for name in "${selected_names[@]}"; do
+        idx=$((idx + 1))
+        _ANIME_SLUG="$(get_slug_from_name "$name")"
+        if [[ -z "${_ANIME_SLUG:-}" ]]; then
+            print_warn "[$idx/$total] Could not resolve slug for '$name', skipping."
+            continue
+        fi
+
+        _ANIME_NAME="$(grep -F "$_ANIME_SLUG" "$_ANIME_LIST_FILE" \
+            | tail -1 \
+            | remove_slug \
+            | sed -E 's/[[:space:]]+$//' \
+            | sed -E 's/[^[:alnum:] ,\+\-\)\(]/_/g')"
+
+        if [[ "$_ANIME_NAME" == "" ]]; then
+            print_warn "[$idx/$total] Anime name not found for '$name'! Skipping."
+            continue
+        fi
+
+        [[ "$total" -gt 1 ]] && print_info "[$idx/$total] Processing: $_ANIME_NAME"
+
+        # reset per-anime episode spec back to whatever (if anything) was passed with -e
+        _ANIME_EPISODE="$_ANIME_EPISODE_ARG"
+
+        # run in a subshell so a failure (curl/jq error under `set -e`, etc.) on one
+        # queued anime doesn't kill the whole session; the rest of the queue continues
+        ( process_one_anime ) || print_warn "[$idx/$total] Failed while processing '$_ANIME_NAME', continuing with the rest of the queue..."
+    done
 }
 
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
